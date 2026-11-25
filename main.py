@@ -29,13 +29,15 @@ async def get_video(data: dict):
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        return {
-            "title": info.get("title", "Instagram video"),
-            "author": info.get("uploader", "Unknown"),
-            "thumbnail": info.get("thumbnail"),
-            "videoUrl": info.get("url"),
-            "audioUrl": info.get("url"),
-        }
+       BACKEND_URL = "https://instagramsaver-backend.onrender.com"
+
+return {
+    "title": info.get("title", "Instagram Reel"),
+    "author": info.get("uploader", ""),
+    "thumbnail": info.get("thumbnail", ""),
+    "videoUrl": f"{BACKEND_URL}/download/{job_id}/video",
+    "audioUrl": f"{BACKEND_URL}/download/{job_id}/audio",
+}
 
     except Exception:
         raise HTTPException(
