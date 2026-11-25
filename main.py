@@ -18,9 +18,12 @@ from pydantic import BaseModel, HttpUrl
 import yt_dlp
 
 
-# Logging
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("instagram_saver")
 
 app = FastAPI()
 
@@ -29,15 +32,24 @@ BACKEND_URL = "https://instagramsaver-backend.onrender.com"
 BASE_DIR = Path("/tmp/media")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Prevent simultaneous extraction jobs.
-PROCESS_LOCK = threading.Lock()
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# Pause requests after Instagram rate limiting.
+# Temporary protection (single Python process only).
+PROCESS_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
+
 RATE_LIMIT_UNTIL = 0
 RATE_LIMIT_SECONDS = 900
 
+# Completed results are cached in memory for 20 minutes.
+CACHE_TTL = 1200
+RESULT_CACHE = {}
 
+
+# --------------------------------------------------
 # CORS
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -48,46 +60,144 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------
+# REQUEST MODEL
+# --------------------------------------------------
+
 class RequestData(BaseModel):
     url: HttpUrl
 
 
+# --------------------------------------------------
+# BASIC ENDPOINTS
+# --------------------------------------------------
+
 @app.get("/")
 def home():
-    return {"status": "Instagram Saver backend is running"}
+    return {
+        "status": "Instagram Saver backend is running"
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
-def is_instagram_url(url):
-    host = urlparse(url).hostname or ""
+# --------------------------------------------------
+# URL VALIDATION
+# --------------------------------------------------
 
-    return host.lower() in (
+def validate_instagram_url(url):
+
+    host = (urlparse(url).hostname or "").lower()
+
+    allowed_hosts = {
         "instagram.com",
-        "www.instagram.com"
+        "www.instagram.com",
+    }
+
+    if host not in allowed_hosts:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a valid Instagram URL."
+        )
+
+    return True
+
+
+def normalize_url(url):
+
+    parsed = urlparse(url)
+
+    return (
+        parsed.scheme.lower()
+        + "://"
+        + parsed.netloc.lower()
+        + parsed.path.rstrip("/")
     )
 
 
-def find_video(folder):
-    candidates = [
-        f for f in folder.glob("media.*")
-        if f.is_file()
-        and f.suffix.lower() not in (
-            ".mp3", ".part", ".ytdl"
+# --------------------------------------------------
+# RATE LIMIT PROTECTION
+# --------------------------------------------------
+
+def check_cooldown():
+
+    remaining = RATE_LIMIT_UNTIL - time.monotonic()
+
+    if remaining > 0:
+
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Instagram is temporarily limiting requests. "
+                "Please try again later."
+            ),
+            headers={
+                "Retry-After": str(int(remaining) + 1)
+            }
         )
+
+
+def activate_cooldown():
+
+    global RATE_LIMIT_UNTIL
+
+    with STATE_LOCK:
+
+        RATE_LIMIT_UNTIL = (
+            time.monotonic() + RATE_LIMIT_SECONDS
+        )
+
+    logger.warning(
+        "Instagram rate limit detected. "
+        "Extraction paused for %s seconds.",
+        RATE_LIMIT_SECONDS
+    )
+
+
+def is_rate_limit_error(error):
+
+    message = str(error).lower()
+
+    return (
+        "429" in message
+        or "too many requests" in message
+    )
+
+
+# --------------------------------------------------
+# FILE HELPERS
+# --------------------------------------------------
+
+def find_video(folder):
+
+    excluded = {
+        ".mp3",
+        ".part",
+        ".ytdl",
+    }
+
+    candidates = [
+        file for file in folder.glob("media.*")
+        if file.is_file()
+        and file.suffix.lower() not in excluded
     ]
 
     return candidates[0] if candidates else None
 
 
-def extract_audio(video, audio):
+def create_mp3(video, audio):
+
     ffmpeg = shutil.which("ffmpeg")
 
     if not ffmpeg:
-        raise RuntimeError("FFmpeg is not installed")
+        raise RuntimeError(
+            "FFmpeg is not installed on the server."
+        )
 
     command = [
         ffmpeg,
@@ -96,173 +206,278 @@ def extract_audio(video, audio):
         "-vn",
         "-codec:a", "libmp3lame",
         "-b:a", "128k",
-        str(audio)
+        str(audio),
     ]
 
     result = subprocess.run(
         command,
         capture_output=True,
         text=True,
-        timeout=180
+        timeout=180,
     )
 
     if result.returncode != 0:
-        logger.error("FFmpeg error: %s", result.stderr[-3000:])
-        raise RuntimeError("Audio conversion failed")
+
+        logger.error(
+            "FFmpeg conversion failed: %s",
+            result.stderr[-2000:]
+        )
+
+        raise RuntimeError("MP3 conversion failed.")
 
     if not audio.exists() or audio.stat().st_size == 0:
-        raise RuntimeError("MP3 file was not generated")
 
+        raise RuntimeError("MP3 file was not generated.")
+
+
+# --------------------------------------------------
+# DUPLICATE RESULT CACHE
+# --------------------------------------------------
+
+def get_cached_result(key):
+
+    with STATE_LOCK:
+
+        item = RESULT_CACHE.get(key)
+
+        if not item:
+            return None
+
+        if time.monotonic() - item["time"] > CACHE_TTL:
+
+            RESULT_CACHE.pop(key, None)
+            return None
+
+        folder = BASE_DIR / item["job_id"]
+
+        if not folder.exists():
+            RESULT_CACHE.pop(key, None)
+            return None
+
+        return item["response"]
+
+
+def save_cached_result(key, job_id, response):
+
+    with STATE_LOCK:
+
+        RESULT_CACHE[key] = {
+            "job_id": job_id,
+            "response": response,
+            "time": time.monotonic(),
+        }
+
+
+# --------------------------------------------------
+# PROCESS INSTAGRAM MEDIA
+# --------------------------------------------------
 
 @app.post("/process")
 def process(data: RequestData):
 
-    global RATE_LIMIT_UNTIL
-
     url = str(data.url)
 
-    if not is_instagram_url(url):
+    validate_instagram_url(url)
+
+    cache_key = normalize_url(url)
+
+    # Reuse recently completed results.
+    cached = get_cached_result(cache_key)
+
+    if cached:
+        logger.info("Returning cached media result.")
+        return cached
+
+    # Only one extraction at a time in this process.
+    if not PROCESS_LOCK.acquire(blocking=False):
+
         raise HTTPException(
-            status_code=400,
-            detail="Please provide a valid Instagram URL."
+            status_code=503,
+            detail=(
+                "The service is currently processing another request. "
+                "Please try again shortly."
+            ),
+            headers={"Retry-After": "15"}
         )
 
-    with PROCESS_LOCK:
+    job_id = None
+    folder = None
 
-        remaining = RATE_LIMIT_UNTIL - time.monotonic()
+    try:
 
-        if remaining > 0:
-            raise HTTPException(
-                status_code=429,
-                detail="Instagram is temporarily limiting requests. Please try again later.",
-                headers={"Retry-After": str(int(remaining) + 1)}
-            )
+        # Check again after acquiring the lock.
+        cached = get_cached_result(cache_key)
+
+        if cached:
+            return cached
+
+        check_cooldown()
 
         if not shutil.which("ffmpeg"):
+
             raise HTTPException(
                 status_code=503,
-                detail="Audio conversion service is unavailable."
+                detail="Audio conversion is temporarily unavailable."
             )
 
         job_id = uuid.uuid4().hex
         folder = BASE_DIR / job_id
+
         folder.mkdir(parents=True, exist_ok=True)
 
         output = str(folder / "media.%(ext)s")
 
         options = {
             "outtmpl": output,
-            "format": (
-                "best[ext=mp4]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-            ),
-            "merge_output_format": "mp4",
-            "postprocessors": [{
-                "key": "FFmpegVideoRemuxer",
-                "preferedformat": "mp4",
-            }],
+            "format": "best[ext=mp4]/best",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
-            "max_filesize": 50 * 1024 * 1024,
+            "max_filesize": MAX_FILE_SIZE,
         }
 
-        try:
-            logger.info("Processing Instagram URL: %s", url)
+        logger.info("Starting Instagram extraction.")
 
-            # Download Instagram video ONCE.
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(
-                    url,
-                    download=True
-                )
+        # Download the video only once.
+        with yt_dlp.YoutubeDL(options) as ydl:
 
-            video = find_video(folder)
+            info = ydl.extract_info(
+                url,
+                download=True
+            )
 
-            if video is None:
-                raise RuntimeError("Video file not found")
+        video = find_video(folder)
 
-            # Convert the already downloaded video locally.
-            audio = folder / "audio.mp3"
-            extract_audio(video, audio)
+        if video is None:
+            raise RuntimeError("Downloaded video not found.")
 
-            logger.info("Media processing completed: %s", job_id)
+        # Extract MP3 locally using FFmpeg.
+        audio = folder / "audio.mp3"
 
-            return {
-                "title": info.get("title", "Instagram Reel"),
-                "author": info.get("uploader", ""),
-                "thumbnail": info.get("thumbnail", ""),
-                "videoUrl": f"{BACKEND_URL}/download/{job_id}/video",
-                "audioUrl": f"{BACKEND_URL}/download/{job_id}/audio",
-            }
+        create_mp3(video, audio)
 
-        except yt_dlp.utils.DownloadError as e:
+        response = {
+            "title": info.get(
+                "title",
+                "Instagram Reel"
+            ),
+            "author": info.get("uploader", ""),
+            "thumbnail": info.get("thumbnail", ""),
+            "videoUrl": (
+                f"{BACKEND_URL}/download/{job_id}/video"
+            ),
+            "audioUrl": (
+                f"{BACKEND_URL}/download/{job_id}/audio"
+            ),
+        }
 
-            error = str(e)
+        save_cached_result(
+            cache_key,
+            job_id,
+            response
+        )
 
-            logger.exception("yt-dlp extraction failed")
+        logger.info(
+            "Media processing completed successfully: %s",
+            job_id
+        )
 
-            if "429" in error or "Too Many Requests" in error:
-                RATE_LIMIT_UNTIL = (
-                    time.monotonic() + RATE_LIMIT_SECONDS
-                )
+        return response
 
+    except HTTPException:
+
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+        raise
+
+    except Exception as error:
+
+        logger.exception("Media processing failed.")
+
+        if is_rate_limit_error(error):
+
+            activate_cooldown()
+
+            if folder:
                 shutil.rmtree(folder, ignore_errors=True)
 
-                raise HTTPException(
-                    status_code=429,
-                    detail="Instagram is temporarily limiting requests. Please wait before trying again.",
-                    headers={"Retry-After": str(RATE_LIMIT_SECONDS)}
-                )
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Instagram is temporarily limiting requests. "
+                    "Please wait before trying again."
+                ),
+                headers={
+                    "Retry-After": str(RATE_LIMIT_SECONDS)
+                }
+            )
 
+        if folder:
             shutil.rmtree(folder, ignore_errors=True)
+
+        if isinstance(error, yt_dlp.utils.DownloadError):
 
             raise HTTPException(
                 status_code=422,
-                detail="Unable to retrieve this Instagram media. It may be unavailable or unsupported."
+                detail=(
+                    "Unable to retrieve this Instagram media. "
+                    "It may be unavailable or unsupported."
+                )
             )
 
-        except HTTPException:
-            shutil.rmtree(folder, ignore_errors=True)
-            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Media processing failed. Please try again later."
+        )
 
-        except Exception:
-            logger.exception("Media processing failed")
+    finally:
 
-            shutil.rmtree(folder, ignore_errors=True)
+        PROCESS_LOCK.release()
 
-            raise HTTPException(
-                status_code=500,
-                detail="Media processing failed. Please try again later."
-            )
 
+# --------------------------------------------------
+# VIDEO AND AUDIO DOWNLOAD
+# --------------------------------------------------
 
 @app.get("/download/{job_id}/{kind}")
 def download(job_id: str, kind: str):
 
     if kind not in ("video", "audio"):
-        raise HTTPException(400, "Invalid download type")
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid download type."
+        )
 
     if (
         len(job_id) != 32
         or not all(c in "0123456789abcdef" for c in job_id)
     ):
-        raise HTTPException(400, "Invalid download ID")
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid download ID."
+        )
 
     folder = BASE_DIR / job_id
 
     if not folder.exists():
+
         raise HTTPException(
             status_code=404,
-            detail="Download expired or unavailable"
+            detail="Download expired or unavailable."
         )
 
     if kind == "video":
+
         file = find_video(folder)
 
         if file is None:
-            raise HTTPException(404, "Video unavailable")
+            raise HTTPException(404, "Video unavailable.")
+
+        filename = "instagram_video" + file.suffix
 
         media_type = (
             "video/mp4"
@@ -270,16 +485,15 @@ def download(job_id: str, kind: str):
             else "application/octet-stream"
         )
 
-        filename = "instagram_video" + file.suffix
-
     else:
+
         file = folder / "audio.mp3"
 
         if not file.exists():
-            raise HTTPException(404, "Audio unavailable")
+            raise HTTPException(404, "Audio unavailable.")
 
-        media_type = "audio/mpeg"
         filename = "instagram_audio.mp3"
+        media_type = "audio/mpeg"
 
     return FileResponse(
         path=file,
